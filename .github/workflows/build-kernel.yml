@@ -1,1 +1,163 @@
+name: Build marble kernel
 
+on:
+  workflow_dispatch:
+    inputs:
+      configs:
+        description: "Config fragments (space separated, relative to arch/arm64/configs)"
+        default: "vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/marble_GKI.config"
+        required: true
+      dt_ref:
+        description: "Branch of sm8450-devicetrees to use"
+        default: "cnb"
+        required: true
+      build_dtbs:
+        description: "Also build device tree blobs (non-fatal if it fails)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  DT_REPO: https://github.com/Evolution-X-Devices/kernel_xiaomi_sm8450-devicetrees
+  # Toolchain: swap this URL/branch if you prefer another clang.
+  CLANG_REPO: https://github.com/kdrag0n/proton-clang
+  CLANG_REF: master
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3
+  DEFCONFIG: gki_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout kernel (with submodules)
+        uses: actions/checkout@v4
+        with:
+          path: kernel
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Unshallow submodules (for correct version numbers)
+        working-directory: kernel
+        run: git submodule foreach --recursive 'git fetch --unshallow --quiet || true'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev cpio zip unzip \
+            xz-utils lz4 zstd dwarves python3 ccache rsync
+
+      - name: Fetch device trees (expected at ../sm8450-devicetrees)
+        run: |
+          # arch/arm64/boot/dts/vendor is a symlink to ../../../../../sm8450-devicetrees
+          git clone --depth 1 -b "${{ inputs.dt_ref }}" "$DT_REPO" sm8450-devicetrees
+          ls -la kernel/arch/arm64/boot/dts/vendor
+          test -d kernel/arch/arm64/boot/dts/vendor/qcom
+
+      - name: Fetch clang toolchain
+        run: |
+          git clone --depth 1 -b "$CLANG_REF" "$CLANG_REPO" clang
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          set -eo pipefail
+          clang --version | head -1
+          mkdir -p out
+          MK="make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          $MK "$DEFCONFIG"
+          FRAGS=""
+          for f in ${{ inputs.configs }}; do FRAGS="$FRAGS arch/arm64/configs/$f"; done
+          scripts/kconfig/merge_config.sh -m -O out out/.config $FRAGS
+          $MK olddefconfig
+          # Make sure KernelSU-Next and NoMount survived config resolution.
+          grep -E '^CONFIG_(KSU|NOMOUNT)=' out/.config
+          grep -q '^CONFIG_KSU=[ym]' out/.config
+          grep -q '^CONFIG_NOMOUNT=[ym]' out/.config
+          echo "MK=$MK" >> "$GITHUB_ENV"
+
+      - name: Build Image
+        working-directory: kernel
+        run: |
+          set -eo pipefail
+          export LOCALVERSION="-marble-x"
+          $MK -j"$(nproc)" Image 2>&1 | tee build.log | tail -n 40
+          test -f out/arch/arm64/boot/Image
+
+      - name: Build device trees
+        if: ${{ inputs.build_dtbs }}
+        continue-on-error: true
+        working-directory: kernel
+        run: |
+          set -eo pipefail
+          $MK -j"$(nproc)" dtbs 2>&1 | tail -n 30
+
+      - name: Collect outputs
+        working-directory: kernel
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist/dtbs"
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/dist/Image"
+          cp out/.config "$GITHUB_WORKSPACE/dist/config"
+          find out/arch/arm64/boot/dts -name '*.dtb' -o -name '*.dtbo' \
+            | grep -E 'ukee|marble' | xargs -r -I{} cp {} "$GITHUB_WORKSPACE/dist/dtbs/"
+          ls -la "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/dist/dtbs"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth 1 "$ANYKERNEL_REPO" ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE ak3/ramdisk ak3/patch
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=marble-kernel-x (KernelSU-Next + NoMount)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          device.name3=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+          cp dist/Image ak3/Image
+          SHA=$(git -C kernel rev-parse --short HEAD)
+          ZIP="marble-kernel-x-$(date +%Y%m%d)-${SHA}.zip"
+          (cd ak3 && zip -r9 -q "$GITHUB_WORKSPACE/dist/$ZIP" . -x '*.git*')
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: dist/${{ env.ZIP }}
+          if-no-files-found: error
+
+      - name: Upload raw build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel-outputs
+          path: |
+            dist/Image
+            dist/config
+            dist/dtbs/
+            kernel/build.log
+          if-no-files-found: warn
