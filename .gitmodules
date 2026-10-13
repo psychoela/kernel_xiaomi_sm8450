@@ -1,0 +1,8 @@
+[submodule "KernelSU-Next"]
+	path = KernelSU-Next
+	url = https://github.com/KernelSU-Next/KernelSU-Next
+	branch = dev
+[submodule "NoMount"]
+	path = NoMount
+	url = https://github.com/maxsteeel/nomount
+	branch = dev
